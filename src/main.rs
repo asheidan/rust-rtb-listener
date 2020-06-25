@@ -3,6 +3,8 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::net::TcpListener;
 
+// https://hyper.rs/guides/server/hello-world/
+
 fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
     let address = listener.local_addr().unwrap();
