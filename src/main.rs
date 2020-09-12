@@ -3,22 +3,40 @@ use std::net::SocketAddr;
 use hyper::{Body, Request, Response, Server};
 use hyper::{Method, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
+use redis::Commands;
 
 // https://hyper.rs/guides/server/hello-world/
 
-async fn request_handler(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+fn get_segments(key: String) -> String {
+    //let nodes = vec!["redis://192.168.0.134/"];
+    //let client = redis::cluster::ClusterClient::open(nodes).unwrap();
+    let client = redis::Client::open("redis://192.168.0.134/").unwrap();
+
+    let mut connection = client.get_connection().unwrap();
+
+    match connection.get(key) {
+        Ok(data) => data,
+        Err(_) => "".to_string(),
+    }
+}
+
+async fn request_handler(request: Request<Body>) -> Result<Response<Body>, Infallible> {
     let mut response = Response::new(Body::empty());
 
-    match (req.method(), req.uri().path()) {
+    match (request.method(), request.uri().path()) {
         (&Method::GET, "/category") => {
-            match req.uri().query() {
-                Some(_data) => {
-                    *response.body_mut() = Body::from("foo\n");
-                    //println!("Data: {}", data);
-                },
-                None => ()
-            };
+            if let Some(data) = request.uri().query() {
+                let url = url::form_urlencoded::parse(data.as_bytes())
+                    .filter(|(k, _v)| k.eq("url"))
+                    .map(|(_k, v)| v)
+                    .next().unwrap();
+
+                let segments = get_segments(url.into());
+                *response.body_mut() = Body::from(segments);
+                //println!("Data: {}", data);
+            }
         },
+
         (&Method::GET, "/ready") => {
             *response.body_mut() = Body::from("1\n");
         },
