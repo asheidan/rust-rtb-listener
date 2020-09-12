@@ -27,7 +27,7 @@ fn handle_connection(mut stream: TcpStream) {
 
     //println!("Request: {}", String::from_utf8_lossy(&buffer[..]));
 
-    let response = "HTTP/1.1 200 OK\r\nConnection keep-alive\r\n\r\n";
+    let response = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n";
 
     stream.write(response.as_bytes()).unwrap();
     stream.flush().unwrap();
