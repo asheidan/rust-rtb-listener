@@ -1,10 +1,16 @@
+use std::task::Context;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::time::Duration;
-use core_affinity;
 use chrono::prelude::Utc;
+use core_affinity;
+use futures::task::Poll;
+use futures::Future;
+use futures::future;
+use futures::future::FutureExt;
 use hyper::server::conn::AddrStream;
-use hyper::service::{make_service_fn, service_fn};
+use hyper::service::Service;
 use hyper::{Body, Request, Response, Server};
 use hyper::{Method, StatusCode};
 use redis::AsyncCommands;
@@ -66,6 +72,7 @@ async fn request_handler(request: Request<Body>) -> Result<Response<Body>, Infal
     Ok(response)
 }
 
+
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
         .await
@@ -83,45 +90,12 @@ async fn main() -> std::io::Result<()> {
     // ConnectionManager implements Send and Sync
     let redis_client = redis_connect().await;
 
-    // More or less straight lifted from example in Hyper documentation
-    // https://docs.rs/hyper/0.13.7/hyper/service/fn.make_service_fn.html
-    let make_svc = make_service_fn(|socket: &AddrStream| {
-        let remote_addr = socket.remote_addr();
-        println!("{:?} Got connection: {}", Utc::now(), remote_addr);
-
-        let redis_client = (&redis_client).clone();
-
-        /*
-        async {
-            let service = service_fn(request_handler);
-            Ok::<_, Infallible>(service)
-        }
-        */
-
-        async move {
-            let service = service_fn(|_request: Request<Body>| async {
-                let redis_client = (&redis_client).clone();
-
-                // The key here should obviously be something from the actual request
-                let result: Result<String, RedisError> = redis_client.get("foo").await;
-                let segments = match result {
-                    Ok(data) => data,
-                    Err(_)   => "".to_string(),
-                };
-
-                Ok::<_, Infallible>(Response::new(Body::from(segments)))
-            });
-
-            Ok::<_, Infallible>(service)
-        }
-
-    });
-
     let server = Server::bind(&address)
         .http1_only(true)
         .http1_keepalive(true)
         .tcp_keepalive(Some(Duration::new(150, 0)))
-        .serve(make_svc);
+        .serve(MakeSvc { redis: redis_client });
+
     println!("Listening on {}", server.local_addr());
 
     let graceful = server.with_graceful_shutdown(shutdown_signal());
@@ -131,4 +105,61 @@ async fn main() -> std::io::Result<()> {
     }
 
     return Ok(());
+}
+
+
+struct RtbService {
+    redis: redis::aio::ConnectionManager,
+}
+impl Service<Request<Body>> for RtbService {
+    type Response = Response<Body>;
+    type Error = hyper::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+
+        let mut redis = self.redis.clone();
+
+        let fut = async move {
+            let result: Result<String, RedisError> = redis.get("foo").await;
+
+            let segments: String = match result {
+                Ok(data) => data,
+                _ => "".to_string(),
+            };
+
+            Ok(Response::new(Body::from(segments)))
+        };
+
+        Box::pin(fut)
+    }
+}
+
+struct MakeSvc {
+    redis: redis::aio::ConnectionManager,
+}
+impl Service<&AddrStream> for MakeSvc {
+    type Response = RtbService;
+    type Error = hyper::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, socket: &AddrStream) -> Self::Future {
+        let remote_addr = socket.remote_addr();
+        println!("{:?} Got connection: {}", Utc::now(), remote_addr);
+
+        let redis = self.redis.clone();
+        let fut = async move { Ok(RtbService { redis }) };
+
+        Box::pin(fut)
+    }
 }
