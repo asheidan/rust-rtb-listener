@@ -9,5 +9,7 @@ edition = "2018"
 [dependencies]
 hyper = "0.13.7"
 tokio = { version = "0.2", features = ["full"] }
-redis = { version = "0.17.0", features = ["cluster"] }
+redis = { version = "0.17.0", default-features = false, features = ["aio", "cluster", "connection-manager"] }
 url = "*"
+chrono = "*"
+core_affinity = "0.5.10"
