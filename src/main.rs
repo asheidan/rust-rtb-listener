@@ -1,5 +1,4 @@
 use std::task::Context;
-use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::time::Duration;
@@ -7,8 +6,6 @@ use chrono::prelude::Utc;
 use core_affinity;
 use futures::task::Poll;
 use futures::Future;
-use futures::future;
-use futures::future::FutureExt;
 use hyper::server::conn::AddrStream;
 use hyper::service::Service;
 use hyper::{Body, Request, Response, Server};
@@ -22,56 +19,9 @@ async fn redis_connect() -> redis::aio::ConnectionManager {
     let connection_info = "redis://192.168.0.134/";
 
     println!("Connecting to redis: {}", connection_info);
-    // TODO: Use async multiplexed connection and connection manager
-    // https://docs.rs/redis/0.16.0/redis/struct.Client.html
-    // https://doc.rust-lang.org/book/ch16-03-shared-state.html
-    // https://doc.rust-lang.org/std/thread/struct.LocalKey.html
-    // https://stackoverflow.com/questions/53038935/cannot-move-out-of-captured-variables-in-an-fnmut-closure
 
-    //let client = redis::cluster::ClusterClient::open(nodes).unwrap();
     redis::Client::open(connection_info).unwrap().get_tokio_connection_manager().await.unwrap()
 }
-
-fn get_segments(key: String) -> String {
-    // println!("{}", key);
-
-    String::from("\n")
-}
-
-async fn request_handler(request: Request<Body>) -> Result<Response<Body>, Infallible> {
-    let mut response = Response::new(Body::empty());
-
-    match (request.method(), request.uri().path()) {
-        (&Method::GET, "/category") => {
-            if let Some(data) = request.uri().query() {
-                let url = url::form_urlencoded::parse(data.as_bytes())
-                    .filter(|(k, _v)| k.eq("url"))
-                    .map(|(_k, v)| v)
-                    .next();
-
-
-                let segments = match url {
-                    Some(url) => get_segments(url.into()),
-                    None => "".to_string(),
-                };
-
-                *response.body_mut() = Body::from(segments);
-                //println!("Data: {}", data);
-            }
-        },
-
-        (&Method::GET, "/ready") => {
-            *response.body_mut() = Body::from("1\n");
-        },
-
-        _ => {
-            *response.status_mut() = StatusCode::NOT_FOUND;
-        },
-    };
-
-    Ok(response)
-}
-
 
 async fn shutdown_signal() {
     tokio::signal::ctrl_c()
@@ -85,9 +35,6 @@ async fn main() -> std::io::Result<()> {
 
     let address = SocketAddr::from(([0, 0, 0, 0], 8080));
 
-    // Trying to share this with the asynchronous request handlers to be able to
-    // reuse the connection to Redis.
-    // ConnectionManager implements Send and Sync
     let redis_client = redis_connect().await;
 
     let server = Server::bind(&address)
@@ -107,10 +54,64 @@ async fn main() -> std::io::Result<()> {
     return Ok(());
 }
 
+trait Rtb {
+    type Future;
+
+    fn handle_ready(&self) -> Self::Future;
+
+    fn handle_404(&self) -> Self::Future;
+
+    fn handle_category(&self, url: String) -> Self::Future;
+
+    fn handle_missing(&self) -> Self::Future;
+}
+
 
 struct RtbService {
     redis: redis::aio::ConnectionManager,
 }
+impl Rtb for RtbService {
+    type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, hyper::Error>> + Send>>;
+
+    fn handle_ready(&self) -> Self::Future {
+        Box::pin(async { Ok(Response::new(Body::from("1\n"))) })
+    }
+
+    fn handle_404(&self) -> Self::Future {
+        Box::pin(async {
+            Ok(
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from("\n"))
+                    .unwrap()
+            )
+        })
+    }
+
+    fn handle_category(&self, url: String) -> Self::Future {
+        let mut redis = self.redis.clone();
+
+        let fut = async move {
+            let result: Result<String, RedisError> = redis.get(url).await;
+
+            let mut segments: String = match result {
+                Ok(data) => data,
+                _ => "".to_string(),
+            };
+
+            segments.push('\n');
+
+            Ok(Response::new(Body::from(segments)))
+        };
+
+        Box::pin(fut)
+    }
+
+    fn handle_missing(&self) -> Self::Future {
+        Box::pin(async { Ok(Response::new(Body::from("\n"))) })
+    }
+}
+
 impl Service<Request<Body>> for RtbService {
     type Response = Response<Body>;
     type Error = hyper::Error;
@@ -123,20 +124,28 @@ impl Service<Request<Body>> for RtbService {
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
 
-        let mut redis = self.redis.clone();
+        let handler = match (request.method(), request.uri().path()) {
+            (&Method::GET, "/category") => {
+                if let Some(data) = request.uri().query() {
+                    let url = url::form_urlencoded::parse(data.as_bytes())
+                        .filter(|(k, _v)| k.eq("url"))
+                        .map(|(_k, v)| v)
+                        .next();
 
-        let fut = async move {
-            let result: Result<String, RedisError> = redis.get("foo").await;
-
-            let segments: String = match result {
-                Ok(data) => data,
-                _ => "".to_string(),
-            };
-
-            Ok(Response::new(Body::from(segments)))
+                    match url {
+                        Some(url) => self.handle_category(url.into_owned()),
+                        None => self.handle_missing(),
+                    }
+                }
+                else {
+                    self.handle_missing()
+                }
+            },
+            (&Method::GET, "/ready") => self.handle_ready(),
+            _ => self.handle_404(),
         };
 
-        Box::pin(fut)
+        handler
     }
 }
 
